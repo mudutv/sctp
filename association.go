@@ -412,25 +412,28 @@ func (a *Association) readLoop() {
 	}()
 
 	a.log.Debugf("[%s] readLoop entered", a.name)
+	buffer := make([]byte, receiveMTU)
 
 	for {
-		// buffer is recreated because the user data is
-		// passed to the reassembly queue without copying
-		buffer := make([]byte, receiveMTU)
-
 		n, err := a.netConn.Read(buffer)
 		if err != nil {
 			closeErr = err
 			break
 		}
-
+		// Make a buffer sized to what we read, then copy the data we
+		// read from the underlying transport. We do this because the
+		// user data is passed to the reassembly queue without
+		// copying.
+		inbound := make([]byte, n)
+		copy(inbound, buffer[:n])
 		atomic.AddUint64(&a.bytesReceived, uint64(n))
-		if err = a.handleInbound(buffer[:n]); err != nil {
-			a.log.Warnf("[%s] %s]", a.name, errors.Wrap(err, "failed to push SCTP packet").Error())
+		if err = a.handleInbound(inbound); err != nil {
+			closeErr = err
+			break
 		}
 	}
 
-	a.log.Debugf("[%s] readLoop exited", a.name)
+	a.log.Debugf("[%s] readLoop exited %s", a.name, closeErr)
 }
 
 func (a *Association) writeLoop() {
@@ -487,19 +490,20 @@ func (a *Association) unregisterStream(s *Stream, err error) {
 func (a *Association) handleInbound(raw []byte) error {
 	p := &packet{}
 	if err := p.unmarshal(raw); err != nil {
-		return errors.Wrap(err, "unable to parse SCTP packet")
+		a.log.Warnf("[%s] unable to parse SCTP packet %s", a.name, err)
+		return nil
 	}
 
 	if err := checkPacket(p); err != nil {
-		return errors.Wrap(err, "failed validating packet")
+		a.log.Warnf("[%s] failed validating packet %s", a.name, err)
+		return nil
 	}
 
 	a.handleChunkStart(p)
 
 	for _, c := range p.chunks {
-		err := a.handleChunk(p, c)
-		if err != nil {
-			a.log.Warnf("[%s] %s", a.name, errors.Wrap(err, "failed handling chunk").Error())
+		if err := a.handleChunk(p, c); err != nil {
+			return err
 		}
 	}
 
@@ -595,7 +599,7 @@ func (a *Association) gatherOutboundFrastRetransmissionPackets(rawPackets [][]by
 				break // end of pending data
 			}
 
-			if c.acked || c.abandoned {
+			if c.acked || c.abandoned() {
 				continue
 			}
 
@@ -817,11 +821,6 @@ func (a *Association) handleInit(p *packet, i *chunkInit) ([]*packet, error) {
 	// responding, the endpoint MUST send the INIT ACK back to the same
 	// address that the original INIT (sent by this endpoint) was sent.
 
-	// https://tools.ietf.org/html/rfc4960#section-5.2.1
-	// Upon receipt of an INIT in the COOKIE-ECHOED state, an endpoint MUST
-	// respond with an INIT ACK using the same parameters it sent in its
-	// original INIT chunk (including its Initiate Tag, unchanged)
-
 	if state != closed && state != cookieWait && state != cookieEchoed {
 		// 5.2.2.  Unexpected INIT in States Other than CLOSED, COOKIE-ECHOED,
 		//        COOKIE-WAIT, and SHUTDOWN-ACK-SENT
@@ -840,6 +839,21 @@ func (a *Association) handleInit(p *packet, i *chunkInit) ([]*packet, error) {
 	// received in the INIT or INIT ACK chunk, and
 	// subtracting one from it.
 	a.peerLastTSN = i.initialTSN - 1
+
+	for _, param := range i.params {
+		switch v := param.(type) {
+		case *paramSupportedExtensions:
+			for _, t := range v.ChunkTypes {
+				if t == ctForwardTSN {
+					a.log.Debugf("[%s] use ForwardTSN (on init)\n", a.name)
+					a.useForwardTSN = true
+				}
+			}
+		}
+	}
+	if !a.useForwardTSN {
+		a.log.Warnf("[%s] not using ForwardTSN (on init)\n", a.name)
+	}
 
 	outbound := &packet{}
 	outbound.verificationTag = a.peerVerificationTag
@@ -913,10 +927,14 @@ func (a *Association) handleInitAck(p *packet, i *chunkInitAck) error {
 		case *paramSupportedExtensions:
 			for _, t := range v.ChunkTypes {
 				if t == ctForwardTSN {
+					a.log.Debugf("[%s] use ForwardTSN (on initAck)\n", a.name)
 					a.useForwardTSN = true
 				}
 			}
 		}
+	}
+	if !a.useForwardTSN {
+		a.log.Warnf("[%s] not using ForwardTSN (on initAck)\n", a.name)
 	}
 	if cookieParam == nil {
 		return errors.Errorf("no cookie in InitAck")
@@ -1165,8 +1183,8 @@ func (a *Association) getOrCreateStream(streamIdentifier uint16) *Stream {
 }
 
 // The caller should hold the lock.
-func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (int, uint32, error) {
-	var totalBytesAcked int
+func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (map[uint16]int, uint32, error) {
+	bytesAckedPerStream := map[uint16]int{}
 
 	// New ack point, so pop all ACKed packets from inflightQueue
 	// We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -1174,7 +1192,7 @@ func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (int, uint32, er
 	for i := a.cumulativeTSNAckPoint + 1; sna32LTE(i, d.cumulativeTSNAck); i++ {
 		c, ok := a.inflightQueue.pop(i)
 		if !ok {
-			return 0, 0, errors.Errorf("tsn %v unable to be popped from inflight queue", i)
+			return nil, 0, errors.Errorf("tsn %v unable to be popped from inflight queue", i)
 		}
 
 		if !c.acked {
@@ -1190,15 +1208,12 @@ func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (int, uint32, er
 
 			nBytesAcked := len(c.userData)
 
-			// Report the number of bytes acknowledged to the stream who sent this DATA
-			// chunk.
-			if s, ok := a.streams[c.streamIdentifier]; ok {
-				a.lock.Unlock()
-				s.onBufferReleased(nBytesAcked)
-				a.lock.Lock()
+			// Sum the number of bytes acknowledged per stream
+			if amount, ok := bytesAckedPerStream[c.streamIdentifier]; ok {
+				bytesAckedPerStream[c.streamIdentifier] = amount + nBytesAcked
+			} else {
+				bytesAckedPerStream[c.streamIdentifier] = nBytesAcked
 			}
-
-			totalBytesAcked += nBytesAcked
 
 			// RFC 4960 sec 6.3.1.  RTO Calculation
 			//   C4)  When data is in flight and when allowed by rule C5 below, a new
@@ -1232,21 +1247,18 @@ func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (int, uint32, er
 			tsn := d.cumulativeTSNAck + uint32(i)
 			c, ok := a.inflightQueue.get(tsn)
 			if !ok {
-				return 0, 0, errors.Errorf("requested non-existent TSN %v", tsn)
+				return nil, 0, errors.Errorf("requested non-existent TSN %v", tsn)
 			}
 
 			if !c.acked {
 				nBytesAcked := a.inflightQueue.markAsAcked(tsn)
 
-				// Report the number of bytes acknowledged to the stream who sent this DATA
-				// chunk.
-				if s, ok := a.streams[c.streamIdentifier]; ok {
-					a.lock.Unlock()
-					s.onBufferReleased(nBytesAcked)
-					a.lock.Lock()
+				// Sum the number of bytes acknowledged per stream
+				if amount, ok := bytesAckedPerStream[c.streamIdentifier]; ok {
+					bytesAckedPerStream[c.streamIdentifier] = amount + nBytesAcked
+				} else {
+					bytesAckedPerStream[c.streamIdentifier] = nBytesAcked
 				}
-
-				totalBytesAcked += nBytesAcked
 
 				a.log.Tracef("[%s] tsn=%d has been sacked", a.name, c.tsn)
 
@@ -1265,7 +1277,7 @@ func (a *Association) processSelectiveAck(d *chunkSelectiveAck) (int, uint32, er
 		}
 	}
 
-	return totalBytesAcked, htna, nil
+	return bytesAckedPerStream, htna, nil
 }
 
 // The caller should hold the lock.
@@ -1353,7 +1365,7 @@ func (a *Association) processFastRetransmission(cumTSNAckPoint, htna uint32, cum
 			if !ok {
 				return errors.Errorf("requested non-existent TSN %v", tsn)
 			}
-			if !c.acked && !c.abandoned && c.missIndicator < 3 {
+			if !c.acked && !c.abandoned() && c.missIndicator < 3 {
 				c.missIndicator++
 				if c.missIndicator == 3 {
 					if !a.inFastRecovery {
@@ -1410,9 +1422,34 @@ func (a *Association) handleSack(d *chunkSelectiveAck) error {
 	}
 
 	// Process selective ack
-	totalBytesAcked, htna, err := a.processSelectiveAck(d)
+	bytesAckedPerStream, htna, err := a.processSelectiveAck(d)
 	if err != nil {
 		return err
+	}
+
+	var totalBytesAcked int
+	for _, nBytesAcked := range bytesAckedPerStream {
+		totalBytesAcked += nBytesAcked
+	}
+
+	cumTSNAckPointAdvanced := false
+	if sna32LT(a.cumulativeTSNAckPoint, d.cumulativeTSNAck) {
+		a.log.Tracef("[%s] SACK: cumTSN advanced: %d -> %d",
+			a.name,
+			a.cumulativeTSNAckPoint,
+			d.cumulativeTSNAck)
+
+		a.cumulativeTSNAckPoint = d.cumulativeTSNAck
+		cumTSNAckPointAdvanced = true
+		a.onCumulativeTSNAckPointAdvanced(totalBytesAcked)
+	}
+
+	for si, nBytesAcked := range bytesAckedPerStream {
+		if s, ok := a.streams[si]; ok {
+			a.lock.Unlock()
+			s.onBufferReleased(nBytesAcked)
+			a.lock.Lock()
+		}
 	}
 
 	// New rwnd value
@@ -1428,18 +1465,6 @@ func (a *Association) handleSack(d *chunkSelectiveAck) error {
 		a.rwnd = 0
 	} else {
 		a.rwnd = d.advertisedReceiverWindowCredit - bytesOutstanding
-	}
-
-	cumTSNAckPointAdvanced := false
-	if sna32LT(a.cumulativeTSNAckPoint, d.cumulativeTSNAck) {
-		a.log.Tracef("[%s] SACK: cumTSN advanced: %d -> %d",
-			a.name,
-			a.cumulativeTSNAckPoint,
-			d.cumulativeTSNAck)
-
-		a.cumulativeTSNAckPoint = d.cumulativeTSNAck
-		cumTSNAckPointAdvanced = true
-		a.onCumulativeTSNAckPointAdvanced(totalBytesAcked)
 	}
 
 	err = a.processFastRetransmission(d.cumulativeTSNAck, htna, cumTSNAckPointAdvanced)
@@ -1459,14 +1484,16 @@ func (a *Association) handleSack(d *chunkSelectiveAck) error {
 			if !ok {
 				break
 			}
-			if !c.abandoned {
+			if !c.abandoned() {
 				break
 			}
 			a.advancedPeerTSNAckPoint = i
 		}
 
 		// RFC 3758 Sec 3.5 C3
-		a.willSendForwardTSN = true
+		if sna32GT(a.advancedPeerTSNAckPoint, a.cumulativeTSNAckPoint) {
+			a.willSendForwardTSN = true
+		}
 		a.awakeWriteLoop()
 	}
 
@@ -1494,9 +1521,6 @@ func (a *Association) createForwardTSN() *chunkForwardTSN {
 		if !ok {
 			break
 		}
-		if c.acked {
-			continue
-		}
 
 		ssn, ok := streamMap[c.streamIdentifier]
 		if !ok {
@@ -1522,7 +1546,7 @@ func (a *Association) createForwardTSN() *chunkForwardTSN {
 			sequence:   ssn,
 		})
 	}
-	a.log.Tracef("[%s] building fwdtsn: newCumulativeTSN=%d - %s", a.name, fwdtsn.newCumulativeTSN, streamStr)
+	a.log.Tracef("[%s] building fwdtsn: newCumulativeTSN=%d cumTSN=%d - %s", a.name, fwdtsn.newCumulativeTSN, a.cumulativeTSNAckPoint, streamStr)
 
 	return fwdtsn
 }
@@ -1569,6 +1593,7 @@ func (a *Association) handleForwardTSN(c *chunkForwardTSN) []*packet {
 	a.log.Tracef("[%s] FwdTSN: %s", a.name, c.String())
 
 	if !a.useForwardTSN {
+		a.log.Warn("[%s] received FwdTSN but not enabled")
 		// Return an error chunk
 		cerr := &chunkError{
 			errorCauses: []errorCause{&errorCauseUnrecognizedChunkType{}},
@@ -1589,6 +1614,8 @@ func (a *Association) handleForwardTSN(c *chunkForwardTSN) []*packet {
 	//   send a SACK to its peer (the sender of the FORWARD TSN) since such a
 	//   duplicate may indicate the previous SACK was lost in the network.
 
+	a.log.Tracef("[%s] should send ack? newCumTSN=%d peerLastTSN=%d\n",
+		a.name, c.newCumulativeTSN, a.peerLastTSN)
 	if sna32LTE(c.newCumulativeTSN, a.peerLastTSN) {
 		a.log.Tracef("[%s] sending ack on Forward TSN", a.name)
 		a.ackState = ackStateImmediate
@@ -1618,8 +1645,17 @@ func (a *Association) handleForwardTSN(c *chunkForwardTSN) []*packet {
 	// from the reassemblyQueue.
 	for _, forwarded := range c.streams {
 		if s, ok := a.streams[forwarded.identifier]; ok {
-			s.handleForwardTSN(c.newCumulativeTSN, forwarded.sequence)
+			s.handleForwardTSNForOrdered(c.newCumulativeTSN, forwarded.sequence)
 		}
+	}
+
+	// TSN may be forewared for unordered chunks. ForwardTSN chunk does not
+	// report which stream identifier it skipped for unordered chunks.
+	// Therefore, we need to broadcast this event to all existing streams for
+	// unordered chunks.
+	// See https://github.com/mudutv/sctp/issues/106
+	for _, s := range a.streams {
+		s.handleForwardTSNForUnordered(c.newCumulativeTSN)
 	}
 
 	return a.handlePeerLastTSNAndAcknowledgement(false)
@@ -1707,6 +1743,11 @@ func (a *Association) movePendingDataChunkToInflightQueue(c *chunkPayloadData) {
 		a.log.Errorf("[%s] failed to pop from pending queue: %s", a.name, err.Error())
 	}
 
+	// Mark all fragements are in-flight now
+	if c.endingFragment {
+		c.setAllInflight()
+	}
+
 	// Assign TSN
 	c.tsn = a.generateNextTSN()
 
@@ -1715,8 +1756,8 @@ func (a *Association) movePendingDataChunkToInflightQueue(c *chunkPayloadData) {
 
 	a.checkPartialReliabilityStatus(c)
 
-	a.log.Tracef("[%s] sending tsn=%d ssn=%d sent=%d len=%d",
-		a.name, c.tsn, c.streamSequenceNumber, c.nSent, len(c.userData))
+	a.log.Tracef("[%s] sending tsn=%d ssn=%d sent=%d len=%d (%v,%v)",
+		a.name, c.tsn, c.streamSequenceNumber, c.nSent, len(c.userData), c.beginningFragment, c.endingFragment)
 
 	// Push it into the inflightQueue
 	a.inflightQueue.pushNoCheck(c)
@@ -1845,17 +1886,19 @@ func (a *Association) checkPartialReliabilityStatus(c *chunkPayloadData) {
 		s.lock.RLock()
 		if s.reliabilityType == ReliabilityTypeRexmit {
 			if c.nSent >= s.reliabilityValue {
-				c.abandoned = true
-				a.log.Tracef("[%s] final (abandoned) tsn=%d (remix: %d)", a.name, c.tsn, c.nSent)
+				c.setAbandoned(true)
+				a.log.Tracef("[%s] marked as abandoned: tsn=%d (remix: %d)", a.name, c.tsn, c.nSent)
 			}
 		} else if s.reliabilityType == ReliabilityTypeTimed {
 			elapsed := int64(time.Since(c.since).Seconds() * 1000)
 			if elapsed >= int64(s.reliabilityValue) {
-				c.abandoned = true
-				a.log.Tracef("[%s] final (abandoned) tsn=%d (timed: %d)", a.name, c.tsn, elapsed)
+				c.setAbandoned(true)
+				a.log.Tracef("[%s] marked as abandoned: tsn=%d (timed: %d)", a.name, c.tsn, elapsed)
 			}
 		}
 		s.lock.RUnlock()
+	} else {
+		a.log.Errorf("[%s] stream %d not found)", a.name, c.streamIdentifier)
 	}
 }
 
@@ -1963,8 +2006,8 @@ func (a *Association) handleChunk(p *packet, c chunk) error {
 	var err error
 
 	if _, err = c.check(); err != nil {
-		return errors.Wrap(err, "failed validating chunk")
-		// TODO: Create ABORT
+		a.log.Errorf("[ %s ] failed validating chunk: %s ", a.name, err)
+		return nil
 	}
 
 	switch c := c.(type) {
@@ -1979,7 +2022,7 @@ func (a *Association) handleChunk(p *packet, c chunk) error {
 		for _, e := range c.errorCauses {
 			errStr += fmt.Sprintf("(%s)", e)
 		}
-		a.log.Debugf("[%s] Abort chunk, with following errors: %s", a.name, errStr)
+		return fmt.Errorf("[%s] Abort chunk, with following errors: %s", a.name, errStr)
 
 	case *chunkError:
 		var errStr string
@@ -2013,8 +2056,10 @@ func (a *Association) handleChunk(p *packet, c chunk) error {
 		err = errors.Errorf("unhandled chunk type")
 	}
 
+	// Log and return, the only condition that is fatal is a ABORT chunk
 	if err != nil {
-		return err
+		a.log.Errorf("Failed to handle chunk: %v", err)
+		return nil
 	}
 
 	if len(packets) > 0 {
@@ -2063,7 +2108,42 @@ func (a *Association) onRetransmissionTimeout(id int, nRtos uint) {
 		a.log.Tracef("[%s] updated cwnd=%d ssthresh=%d inflight=%d (RTO)",
 			a.name, a.cwnd, a.ssthresh, a.inflightQueue.getNumBytes())
 
+		// RFC 3758 sec 3.5
+		//  A5) Any time the T3-rtx timer expires, on any destination, the sender
+		//  SHOULD try to advance the "Advanced.Peer.Ack.Point" by following
+		//  the procedures outlined in C2 - C5.
+		if a.useForwardTSN {
+			// RFC 3758 Sec 3.5 C2
+			for i := a.advancedPeerTSNAckPoint + 1; ; i++ {
+				c, ok := a.inflightQueue.get(i)
+				if !ok {
+					break
+				}
+				if !c.abandoned() {
+					break
+				}
+				a.advancedPeerTSNAckPoint = i
+			}
+
+			// RFC 3758 Sec 3.5 C3
+			if sna32GT(a.advancedPeerTSNAckPoint, a.cumulativeTSNAckPoint) {
+				a.willSendForwardTSN = true
+			}
+		}
+
 		a.log.Debugf("[%s] T3-rtx timed out: nRtos=%d cwnd=%d ssthresh=%d", a.name, nRtos, a.cwnd, a.ssthresh)
+
+		/*
+			a.log.Debugf("   - advancedPeerTSNAckPoint=%d", a.advancedPeerTSNAckPoint)
+			a.log.Debugf("   - cumulativeTSNAckPoint=%d", a.cumulativeTSNAckPoint)
+			a.inflightQueue.updateSortedKeys()
+			for i, tsn := range a.inflightQueue.sorted {
+				if c, ok := a.inflightQueue.get(tsn); ok {
+					a.log.Debugf("   - [%d] tsn=%d acked=%v abandoned=%v (%v,%v) len=%d",
+						i, c.tsn, c.acked, c.abandoned(), c.beginningFragment, c.endingFragment, len(c.userData))
+				}
+			}
+		*/
 
 		a.inflightQueue.markAllToRetrasmit()
 		a.awakeWriteLoop()
