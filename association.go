@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/mudutv/logging"
+	"github.com/mudutv/randutil"
 	"github.com/pkg/errors"
 )
+
+// Use global random generator to properly seed by crypto grade random.
+var globalMathRandomGenerator = randutil.NewMathRandomGenerator()
 
 const (
 	receiveMTU          uint32 = 8192 // MTU for inbound packet (from DTLS)
@@ -229,9 +232,6 @@ func Client(config Config) (*Association, error) {
 }
 
 func createAssociation(config Config) *Association {
-	rs := rand.NewSource(time.Now().UnixNano())
-	r := rand.New(rs)
-
 	var maxReceiveBufferSize uint32
 	if config.MaxReceiveBufferSize == 0 {
 		maxReceiveBufferSize = initialRecvBufSize
@@ -239,7 +239,7 @@ func createAssociation(config Config) *Association {
 		maxReceiveBufferSize = config.MaxReceiveBufferSize
 	}
 
-	tsn := r.Uint32()
+	tsn := globalMathRandomGenerator.Uint32()
 	a := &Association{
 		netConn:                 config.NetConn,
 		maxReceiveBufferSize:    maxReceiveBufferSize,
@@ -251,7 +251,7 @@ func createAssociation(config Config) *Association {
 		controlQueue:            newControlQueue(),
 		mtu:                     initialMTU,
 		maxPayloadSize:          initialMTU - (commonHeaderSize + dataChunkHeaderSize),
-		myVerificationTag:       r.Uint32(),
+		myVerificationTag:       globalMathRandomGenerator.Uint32(),
 		myNextTSN:               tsn,
 		myNextRSN:               tsn,
 		minTSN2MeasureRTT:       tsn,
@@ -869,7 +869,10 @@ func (a *Association) handleInit(p *packet, i *chunkInit) ([]*packet, error) {
 	initAck.advertisedReceiverWindowCredit = a.maxReceiveBufferSize
 
 	if a.myCookie == nil {
-		a.myCookie = newRandomStateCookie()
+		var err error
+		if a.myCookie, err = newRandomStateCookie(); err != nil {
+			return nil, err
+		}
 	}
 
 	initAck.params = []param{a.myCookie}
@@ -979,19 +982,27 @@ func (a *Association) handleHeartbeat(c *chunkHeartbeat) []*packet {
 func (a *Association) handleCookieEcho(c *chunkCookieEcho) []*packet {
 	state := a.getState()
 	a.log.Debugf("[%s] COOKIE-ECHO received in state '%s'", a.name, getAssociationStateString(state))
-	if state != closed && state != cookieWait && state != cookieEchoed {
+	switch state {
+	default:
 		return nil
+	case established:
+		if !bytes.Equal(a.myCookie.cookie, c.cookie) {
+			return nil
+		}
+	case closed, cookieWait, cookieEchoed:
+		if !bytes.Equal(a.myCookie.cookie, c.cookie) {
+			return nil
+		}
+
+		a.t1Init.stop()
+		a.storedInit = nil
+
+		a.t1Cookie.stop()
+		a.storedCookieEcho = nil
+
+		a.setState(established)
+		a.handshakeCompletedCh <- nil
 	}
-
-	if !bytes.Equal(a.myCookie.cookie, c.cookie) {
-		return nil
-	}
-
-	a.t1Init.stop()
-	a.storedInit = nil
-
-	a.t1Cookie.stop()
-	a.storedCookieEcho = nil
 
 	p := &packet{
 		verificationTag: a.peerVerificationTag,
@@ -999,9 +1010,6 @@ func (a *Association) handleCookieEcho(c *chunkCookieEcho) []*packet {
 		destinationPort: a.destinationPort,
 		chunks:          []chunk{&chunkCookieAck{}},
 	}
-
-	a.setState(established)
-	a.handshakeCompletedCh <- nil
 	return pack(p)
 }
 
